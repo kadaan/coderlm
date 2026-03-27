@@ -5,10 +5,12 @@ use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use tower_http::trace::TraceLayer;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::ops::{annotations, content, history, structure, symbol_ops};
+use crate::review::{self, ReviewStatus};
 use crate::server::errors::AppError;
 use crate::server::session::Session;
 use crate::server::state::{AppState, Project};
@@ -49,6 +51,46 @@ fn record_history(state: &AppState, session_id: Option<&str>, method: &str, path
     }
 }
 
+/// Resolve session → review. Returns an error if no review is attached or the
+/// review is not yet ready.
+fn require_ready_review(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Arc<review::Review>, AppError> {
+    let sid = require_session(headers)?;
+    let review = state.get_review_for_session(&sid)?;
+    // Updating is also acceptable — the existing diff is still valid during an incremental refresh.
+    if !matches!(*review.status.read(), ReviewStatus::Ready | ReviewStatus::Updating) {
+        let status_str = match &*review.status.read() {
+            ReviewStatus::Indexing => "indexing",
+            ReviewStatus::Computing => "computing",
+            ReviewStatus::Updating => "updating",
+            ReviewStatus::Error(msg) => return Err(AppError::Internal(msg.clone())),
+            ReviewStatus::Ready => "ready",
+        };
+        return Err(AppError::BadRequest(format!(
+            "Review is not ready yet (status: {}). Poll GET /api/v1/reviews/{{id}} until status is 'ready'.",
+            status_str
+        )));
+    }
+    Ok(review)
+}
+
+/// If `branch=base` is requested, return the base project from the session's
+/// review. Otherwise return the normal head project.
+fn resolve_project_for_branch(
+    state: &AppState,
+    headers: &HeaderMap,
+    branch: Option<&str>,
+) -> Result<Arc<Project>, AppError> {
+    if branch == Some("base") {
+        let review = require_ready_review(state, headers)?;
+        Ok(review.base_project.clone())
+    } else {
+        require_project(state, headers)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Router construction
 // ---------------------------------------------------------------------------
@@ -86,7 +128,22 @@ pub fn build_routes(state: AppState) -> Router {
         // Annotations
         .route("/api/v1/annotations/save", post(save_annotations))
         .route("/api/v1/annotations/load", post(load_annotations))
+        // Reviews: lifecycle
+        .route("/api/v1/reviews", get(list_reviews).post(create_review_handler))
+        .route("/api/v1/reviews/{id}", get(get_review).delete(delete_review_handler))
+        .route("/api/v1/reviews/{id}/attach", post(attach_review))
+        .route("/api/v1/reviews/{id}/update", post(update_review_handler))
+        // Reviews: diff queries (require session with attached review)
+        .route("/api/v1/review/summary", get(review_summary))
+        .route("/api/v1/review/files", get(review_files))
+        .route("/api/v1/review/symbols", get(review_symbols))
+        .route("/api/v1/review/file-diff", get(review_file_diff))
+        // Reviews: cross-reference queries
+        .route("/api/v1/review/safety", get(review_safety))
+        .route("/api/v1/review/impact", get(review_impact))
+        .route("/api/v1/review/test-coverage", get(review_test_coverage))
         .with_state(state)
+        .layer(TraceLayer::new_for_http())
 }
 
 // ---------------------------------------------------------------------------
@@ -317,6 +374,8 @@ struct SymbolListQuery {
     kind: Option<String>,
     file: Option<String>,
     limit: Option<usize>,
+    /// "base" to query the base branch when a review is attached.
+    branch: Option<String>,
 }
 
 async fn list_symbols(
@@ -324,7 +383,7 @@ async fn list_symbols(
     headers: HeaderMap,
     Query(params): Query<SymbolListQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let project = require_project(&state, &headers)?;
+    let project = resolve_project_for_branch(&state, &headers, params.branch.as_deref())?;
     let kind_filter = params.kind.as_deref().and_then(SymbolKind::from_str);
     let limit = params.limit.unwrap_or(100);
     let results = symbol_ops::list_symbols(
@@ -402,6 +461,7 @@ async fn redefine_symbol(
 struct ImplementationQuery {
     symbol: String,
     file: String,
+    branch: Option<String>,
 }
 
 async fn get_implementation(
@@ -409,7 +469,7 @@ async fn get_implementation(
     headers: HeaderMap,
     Query(params): Query<ImplementationQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let project = require_project(&state, &headers)?;
+    let project = resolve_project_for_branch(&state, &headers, params.branch.as_deref())?;
     let source = symbol_ops::get_implementation(
         &project.root,
         &project.symbol_table,
@@ -431,6 +491,7 @@ struct TestsQuery {
     symbol: String,
     file: String,
     limit: Option<usize>,
+    branch: Option<String>,
 }
 
 async fn find_tests(
@@ -438,7 +499,7 @@ async fn find_tests(
     headers: HeaderMap,
     Query(params): Query<TestsQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let project = require_project(&state, &headers)?;
+    let project = resolve_project_for_branch(&state, &headers, params.branch.as_deref())?;
     let limit = params.limit.unwrap_or(20);
     let tests = symbol_ops::find_tests(
         &project.root,
@@ -459,6 +520,7 @@ struct CallersQuery {
     symbol: String,
     file: String,
     limit: Option<usize>,
+    branch: Option<String>,
 }
 
 async fn find_callers(
@@ -466,7 +528,7 @@ async fn find_callers(
     headers: HeaderMap,
     Query(params): Query<CallersQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let project = require_project(&state, &headers)?;
+    let project = resolve_project_for_branch(&state, &headers, params.branch.as_deref())?;
     let limit = params.limit.unwrap_or(50);
     let callers = symbol_ops::find_callers(
         &project.root,
@@ -672,4 +734,433 @@ async fn load_annotations(
     });
     record_history(&state, session_id(&headers).as_deref(), "POST", "/annotations/load", "loaded");
     Ok(Json(json!({ "ok": true, "loaded": summary })))
+}
+
+// ---------------------------------------------------------------------------
+// Reviews: lifecycle
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct CreateReviewBody {
+    cwd: String,
+    base_ref: String,
+    head_ref: Option<String>,
+}
+
+async fn create_review_handler(
+    State(state): State<AppState>,
+    Json(body): Json<CreateReviewBody>,
+) -> Result<Json<Value>, AppError> {
+    let cwd = PathBuf::from(&body.cwd);
+    let base_ref = body.base_ref.clone();
+    let head_ref = body.head_ref.clone().unwrap_or_else(|| "HEAD".to_string());
+
+    // create_review does blocking I/O (git commands + directory scan)
+    let review = tokio::task::spawn_blocking(move || {
+        state.create_review(&cwd, &base_ref, &head_ref)
+    })
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))??;
+
+    Ok(Json(json!({
+        "review_id": review.id,
+        "status": "indexing",
+        "base_ref": review.base_ref,
+        "head_ref": review.head_ref,
+        "base_commit": &review.base_commit[..8],
+        "head_commit": &review.head_commit.read()[..8],
+    })))
+}
+
+async fn list_reviews(State(state): State<AppState>) -> Json<Value> {
+    let reviews: Vec<Value> = state
+        .inner
+        .reviews
+        .iter()
+        .map(|entry| {
+            let r = entry.value();
+            let status = match &*r.status.read() {
+                ReviewStatus::Indexing => "indexing",
+                ReviewStatus::Computing => "computing",
+                ReviewStatus::Updating => "updating",
+                ReviewStatus::Ready => "ready",
+                ReviewStatus::Error(_) => "error",
+            };
+            json!({
+                "review_id": r.id,
+                "base_ref": r.base_ref,
+                "head_ref": r.head_ref,
+                "status": status,
+                "created_at": r.created_at.to_rfc3339(),
+            })
+        })
+        .collect();
+    Json(json!({ "reviews": reviews, "count": reviews.len() }))
+}
+
+#[derive(Deserialize)]
+struct ReviewPath {
+    id: String,
+}
+
+async fn get_review(
+    State(state): State<AppState>,
+    axum::extract::Path(params): axum::extract::Path<ReviewPath>,
+) -> Result<Json<Value>, AppError> {
+    let review = state
+        .inner
+        .reviews
+        .get(&params.id)
+        .ok_or_else(|| AppError::NotFound(format!("Review '{}' not found", params.id)))?;
+
+    let status_str = match &*review.status.read() {
+        ReviewStatus::Indexing => "indexing",
+        ReviewStatus::Computing => "computing",
+        ReviewStatus::Updating => "updating",
+        ReviewStatus::Ready => "ready",
+        ReviewStatus::Error(_) => "error",
+    };
+
+    let stats = review.diff.read().as_ref().map(|d| {
+        json!({
+            "files_added": d.stats.files_added,
+            "files_deleted": d.stats.files_deleted,
+            "files_modified": d.stats.files_modified,
+            "symbols_added": d.stats.symbols_added,
+            "symbols_deleted": d.stats.symbols_deleted,
+            "symbols_modified": d.stats.symbols_modified,
+            "symbols_moved": d.stats.symbols_moved,
+        })
+    });
+
+    // Check staleness: does head_ref still point to head_commit?
+    let repo_root = review.repo_root.clone();
+    let head_ref = review.head_ref.clone();
+    let head_commit = review.head_commit.read().clone();
+    let stale = tokio::task::spawn_blocking(move || {
+        crate::git::resolve_ref(&repo_root, &head_ref)
+            .map(|current| current != head_commit)
+            .unwrap_or(false)
+    })
+    .await
+    .unwrap_or(false);
+
+    Ok(Json(json!({
+        "review_id": review.id,
+        "base_ref": review.base_ref,
+        "head_ref": review.head_ref,
+        "base_commit": &review.base_commit[..8],
+        "head_commit": &review.head_commit.read()[..8],
+        "status": status_str,
+        "created_at": review.created_at.to_rfc3339(),
+        "stats": stats,
+        "stale": stale,
+    })))
+}
+
+async fn delete_review_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(params): axum::extract::Path<ReviewPath>,
+) -> Result<Json<Value>, AppError> {
+    state.delete_review(&params.id)?;
+    Ok(Json(json!({ "deleted": true })))
+}
+
+async fn attach_review(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(params): axum::extract::Path<ReviewPath>,
+) -> Result<Json<Value>, AppError> {
+    let sid = require_session(&headers)?;
+
+    // Verify the review exists
+    if !state.inner.reviews.contains_key(&params.id) {
+        return Err(AppError::NotFound(format!("Review '{}' not found", params.id)));
+    }
+
+    // Set review_id on the session
+    let mut session = state
+        .inner
+        .sessions
+        .get_mut(&sid)
+        .ok_or_else(|| AppError::NotFound(format!("Session '{}' not found", sid)))?;
+
+    session.review_id = Some(params.id.clone());
+
+    Ok(Json(json!({ "ok": true, "review_id": params.id })))
+}
+
+#[derive(Deserialize)]
+struct UpdateReviewBody {
+    head_ref: Option<String>,
+}
+
+async fn update_review_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(params): axum::extract::Path<ReviewPath>,
+    body: Option<Json<UpdateReviewBody>>,
+) -> Result<Json<Value>, AppError> {
+    let review_id = params.id.clone();
+    let head_ref = body
+        .and_then(|b| b.head_ref.clone())
+        .unwrap_or_else(|| "HEAD".to_string());
+
+    let state2 = state.clone();
+    tokio::task::spawn_blocking(move || state2.update_review(&review_id, &head_ref))
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))??;
+
+    let review = state
+        .inner
+        .reviews
+        .get(&params.id)
+        .ok_or_else(|| AppError::NotFound(format!("Review '{}' not found", params.id)))?;
+
+    Ok(Json(json!({
+        "review_id": review.id,
+        "status": "ready",
+        "head_ref": review.head_ref,
+        "head_commit": &review.head_commit.read()[..8],
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Reviews: diff queries
+// ---------------------------------------------------------------------------
+
+async fn review_summary(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let review = require_ready_review(&state, &headers)?;
+    let diff = review.diff.read();
+    let diff = diff.as_ref().expect("status=Ready implies diff is Some");
+
+    Ok(Json(json!({
+        "base_ref": review.base_ref,
+        "head_ref": review.head_ref,
+        "base_commit": &review.base_commit[..8],
+        "head_commit": &review.head_commit.read()[..8],
+        "status": "ready",
+        "files_added": diff.stats.files_added,
+        "files_deleted": diff.stats.files_deleted,
+        "files_modified": diff.stats.files_modified,
+        "files_renamed": diff.stats.files_renamed,
+        "symbols_added": diff.stats.symbols_added,
+        "symbols_deleted": diff.stats.symbols_deleted,
+        "symbols_modified": diff.stats.symbols_modified,
+        "symbols_moved": diff.stats.symbols_moved,
+    })))
+}
+
+async fn review_files(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let review = require_ready_review(&state, &headers)?;
+    let diff = review.diff.read();
+    let diff = diff.as_ref().expect("status=Ready implies diff is Some");
+
+    let files = serde_json::to_value(&diff.file_diffs).unwrap();
+    Ok(Json(json!({ "files": files, "count": diff.file_diffs.len() })))
+}
+
+#[derive(Deserialize)]
+struct ReviewSymbolsQuery {
+    change: Option<String>,
+    file: Option<String>,
+    kind: Option<String>,
+}
+
+async fn review_symbols(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<ReviewSymbolsQuery>,
+) -> Result<Json<Value>, AppError> {
+    let review = require_ready_review(&state, &headers)?;
+    let diff = review.diff.read();
+    let diff = diff.as_ref().expect("status=Ready implies diff is Some");
+
+    let kind_filter = params.kind.as_deref().and_then(SymbolKind::from_str);
+
+    let symbols: Vec<Value> = diff
+        .symbol_diffs
+        .iter()
+        .filter(|s| {
+            // Filter by change type
+            if let Some(change) = params.change.as_deref() {
+                let matches = match change {
+                    "added" => matches!(s.change, review::SymbolChange::Added),
+                    "deleted" => matches!(s.change, review::SymbolChange::Deleted),
+                    "modified" => matches!(s.change, review::SymbolChange::Modified { .. }),
+                    _ => true,
+                };
+                if !matches { return false; }
+            }
+            // Filter by file
+            if let Some(file) = params.file.as_deref() {
+                if s.file != file { return false; }
+            }
+            // Filter by kind
+            if let Some(kind) = kind_filter {
+                if s.kind != kind { return false; }
+            }
+            true
+        })
+        .map(|s| serde_json::to_value(s).unwrap())
+        .collect();
+
+    Ok(Json(json!({ "symbols": symbols, "count": symbols.len() })))
+}
+
+#[derive(Deserialize)]
+struct ReviewFileDiffQuery {
+    file: String,
+}
+
+async fn review_file_diff(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<ReviewFileDiffQuery>,
+) -> Result<Json<Value>, AppError> {
+    let review = require_ready_review(&state, &headers)?;
+    let file = params.file.clone();
+
+    // Check cache first.
+    if let Some(cached) = review.cache.file_diffs.get(&file) {
+        return Ok(Json(json!({ "file": file, "diff": cached.clone() })));
+    }
+
+    let repo_root = review.repo_root.clone();
+    let base_ref = review.base_ref.clone();
+    let head_ref = review.head_ref.clone();
+    let file_for_blocking = file.clone();
+
+    let diff_text = tokio::task::spawn_blocking(move || {
+        crate::git::get_file_diff(&repo_root, &base_ref, &head_ref, &file_for_blocking)
+    })
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?
+    .map_err(|e| AppError::BadRequest(e.to_string()))?;
+
+    review.cache.file_diffs.insert(file.clone(), diff_text.clone());
+
+    Ok(Json(json!({ "file": file, "diff": diff_text })))
+}
+
+// ---------------------------------------------------------------------------
+// Reviews: cross-reference queries
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ReviewSafetyQuery {
+    depth: Option<usize>,
+}
+
+async fn review_safety(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<ReviewSafetyQuery>,
+) -> Result<Json<Value>, AppError> {
+    let review = require_ready_review(&state, &headers)?;
+    let depth = params.depth.unwrap_or(1).clamp(1, 3);
+
+    // Cache is only valid for depth=1 (the default).
+    if depth == 1 {
+        if let Some(cached) = review.cache.safety_report.read().clone() {
+            return Ok(Json(serde_json::to_value(cached.as_ref()).unwrap()));
+        }
+    }
+
+    let base_project = review.base_project.clone();
+    let diff = review.diff.read().clone().expect("status=Ready implies diff is Some");
+
+    let report = tokio::task::spawn_blocking(move || {
+        review::impact::compute_safety(&base_project, &diff, depth)
+    })
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let report = std::sync::Arc::new(report);
+    if depth == 1 {
+        *review.cache.safety_report.write() = Some(report.clone());
+    }
+
+    Ok(Json(serde_json::to_value(report.as_ref()).unwrap()))
+}
+
+#[derive(Deserialize)]
+struct ReviewImpactQuery {
+    symbol: String,
+    file: String,
+    depth: Option<usize>,
+}
+
+async fn review_impact(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<ReviewImpactQuery>,
+) -> Result<Json<Value>, AppError> {
+    let review = require_ready_review(&state, &headers)?;
+    let depth = params.depth.unwrap_or(1).clamp(1, 3);
+    let cache_key = review::ReviewCache::impact_key(&params.file, &params.symbol);
+
+    // Cache is only valid for depth=1.
+    if depth == 1 {
+        if let Some(cached) = review.cache.impact_results.get(&cache_key) {
+            return Ok(Json(serde_json::to_value(cached.as_ref()).unwrap()));
+        }
+    }
+
+    let base_project = review.base_project.clone();
+    let head_project = review.head_project.clone();
+    let diff = review.diff.read().clone().expect("status=Ready implies diff is Some");
+    let symbol = params.symbol.clone();
+    let file = params.file.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        review::impact::compute_impact(&base_project, &head_project, &diff, &symbol, &file, depth)
+    })
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    match result {
+        Some(impact) => {
+            let impact = std::sync::Arc::new(impact);
+            if depth == 1 {
+                review.cache.impact_results.insert(cache_key, impact.clone());
+            }
+            Ok(Json(serde_json::to_value(impact.as_ref()).unwrap()))
+        }
+        None => Err(AppError::NotFound(format!(
+            "Symbol '{}' in '{}' not found in the review diff",
+            params.symbol, params.file
+        ))),
+    }
+}
+
+async fn review_test_coverage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let review = require_ready_review(&state, &headers)?;
+
+    // Check cache first.
+    if let Some(cached) = review.cache.test_coverage.read().clone() {
+        return Ok(Json(serde_json::to_value(cached.as_ref()).unwrap()));
+    }
+
+    let head_project = review.head_project.clone();
+    let diff = review.diff.read().clone().expect("status=Ready implies diff is Some");
+
+    let report = tokio::task::spawn_blocking(move || {
+        review::impact::compute_test_coverage(&head_project, &diff)
+    })
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let report = std::sync::Arc::new(report);
+    *review.cache.test_coverage.write() = Some(report.clone());
+
+    Ok(Json(serde_json::to_value(report.as_ref()).unwrap()))
 }

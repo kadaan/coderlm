@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::path::Path;
 use std::sync::Arc;
 use tree_sitter::StreamingIterator;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use crate::index::file_entry::Language;
 use crate::index::file_tree::FileTree;
@@ -164,7 +164,7 @@ pub fn extract_symbols_from_file(
         }
     }
 
-    debug!("Extracted {} symbols from {}", symbols.len(), rel_path);
+    trace!("Extracted {} symbols from {}", symbols.len(), rel_path);
     Ok(symbols)
 }
 

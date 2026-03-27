@@ -1,0 +1,85 @@
+{
+  "lockfile_version": "1",
+  "packages": {
+    "apple-sdk_14@14.4": {
+      "last_modified": "2025-10-22T20:59:19Z",
+      "resolved": "github:NixOS/nixpkgs/01b6809f7f9d1183a2b3e081f0a1e6f8f415cb09#apple-sdk_14",
+      "source": "devbox-search",
+      "version": "14.4",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/5kr7vb4fj0w4kylf9hkxs27v9a5bjiir-apple-sdk-14.4",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/5kr7vb4fj0w4kylf9hkxs27v9a5bjiir-apple-sdk-14.4"
+        },
+        "x86_64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/vlzy53sjkkqpf5mbfskvg3imwcrr70ix-apple-sdk-14.4",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/vlzy53sjkkqpf5mbfskvg3imwcrr70ix-apple-sdk-14.4"
+        }
+      }
+    },
+    "cargo@latest": {
+      "last_modified": "2026-03-21T07:29:51Z",
+      "resolved": "github:NixOS/nixpkgs/09061f748ee21f68a089cd5d91ec1859cd93d0be#cargo",
+      "source": "devbox-search",
+      "version": "1.94.0",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/fp6mq617pb2rwrkc2fspjbwgf85jdb6n-cargo-1.94.0",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/fp6mq617pb2rwrkc2fspjbwgf85jdb6n-cargo-1.94.0"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/1bdvj13077clgqxwpgpgs2zzr8fsk99g-cargo-1.94.0",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/1bdvj13077clgqxwpgpgs2zzr8fsk99g-cargo-1.94.0"
+        },
+        "x86_64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/ygg9vaqqmyrjbndjac90qc26mbibpi09-cargo-1.94.0",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/ygg9vaqqmyrjbndjac90qc26mbibpi09-cargo-1.94.0"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/xlli1a8m35h5kwavjajnp6nl90xmjgcx-cargo-1.94.0",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/xlli1a8m35h5kwavjajnp6nl90xmjgcx-cargo-1.94.0"
+        }
+      }
+    },
+    "github:NixOS/nixpkgs/nixpkgs-unstable": {
+      "last_modified": "2026-03-23T13:48:00Z",
+      "resolved": "github:NixOS/nixpkgs/fdc7b8f7b30fdbedec91b71ed82f36e1637483ed?lastModified=1774273680"
+    }
+  }
+}

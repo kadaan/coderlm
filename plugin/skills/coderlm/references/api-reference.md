@@ -94,6 +94,16 @@ python3 cli load-annotations
 python3 cli history [--limit 50]
 ```
 
+### Base Branch Queries (with review attached)
+
+```bash
+# Query base branch snapshot for comparison (requires attached review)
+python3 cli impl run_server --file src/main.rs --branch base
+python3 cli callers scan_directory --file src/index/walker.rs --branch base
+python3 cli symbols --file src/routes.rs --branch base
+python3 cli tests scan_directory --file src/index/walker.rs --branch base
+```
+
 ## Response Shapes
 
 ### structure
@@ -234,6 +244,172 @@ Same shape as symbols response.
 | SQL        | `.sql`                        | regex        |
 
 Languages with tree-sitter support produce full symbol tables (functions, classes, methods, callers, variables). SQL uses regex fallbacks for variable and definition detection. All other file types appear in the file tree and are searchable via peek/grep, but do not produce symbols.
+
+## Mark Types
+
+`documentation`, `ignore`, `test`, `config`, `generated`, `custom`
+
+## Code Review API
+
+Review endpoints compare two indexed snapshots of a repo (base branch vs PR branch). A review must be created and attached to a session before using the diff/safety/impact endpoints.
+
+### Review Lifecycle
+
+```bash
+# Create a review (indexes base branch in a git worktree, computes semantic diff)
+python3 cli review-init --base main [--head HEAD]
+# → polls until status=ready
+
+# Show status of attached review
+python3 cli review-status
+
+# Delete review and clean up worktree
+python3 cli review-cleanup
+```
+
+### Diff Queries (require attached review)
+
+```bash
+# High-level stats
+python3 cli review-summary
+
+# Changed files
+python3 cli review-files
+
+# Changed symbols (filter by change type, file, or kind)
+python3 cli review-symbols [--change added|deleted|modified] [--file path] [--kind function]
+
+# Unified diff for a specific file
+python3 cli review-file-diff --file src/server/routes.rs
+```
+
+### Cross-Reference Queries
+
+```bash
+# Find deleted/signature-changed symbols that have callers in unmodified files
+python3 cli review-safety
+
+# Per-symbol blast radius: all callers in base branch, annotated with PR change status
+python3 cli review-impact process_request --file src/server/routes.rs
+
+# Test coverage of added/modified symbols
+python3 cli review-test-coverage
+```
+
+### Base Branch Queries (existing commands)
+
+Add `--branch base` to query the base snapshot when a review is attached:
+
+```bash
+python3 cli impl process_request --file src/routes.rs --branch base  # old version
+python3 cli callers process_request --file src/routes.rs --branch base  # callers in base
+python3 cli symbols --file src/routes.rs --branch base  # symbols in base version
+python3 cli tests process_request --file src/routes.rs --branch base  # tests in base
+```
+
+### Response Shapes
+
+#### review-summary
+```json
+{
+  "base_ref": "main",
+  "head_ref": "feature-branch",
+  "base_commit": "abc12345",
+  "head_commit": "def67890",
+  "status": "ready",
+  "files_added": 3,
+  "files_deleted": 1,
+  "files_modified": 7,
+  "files_renamed": 0,
+  "symbols_added": 12,
+  "symbols_deleted": 4,
+  "symbols_modified": 8
+}
+```
+
+#### review-files
+```json
+{
+  "count": 11,
+  "files": [
+    {"path": "src/new_module.rs", "status": "added", "language": "rust"},
+    {"path": "src/old.rs", "status": "deleted", "language": "rust"},
+    {"path": "src/server/routes.rs", "status": "modified", "language": "rust"},
+    {"path": "src/server/routes.rs", "status": "renamed", "old_path": "src/old_routes.rs", "language": "rust"}
+  ]
+}
+```
+
+#### review-symbols
+```json
+{
+  "count": 3,
+  "symbols": [
+    {"name": "handle_review", "file": "src/routes.rs", "kind": "function", "change": "added"},
+    {
+      "name": "process_request",
+      "file": "src/routes.rs",
+      "kind": "function",
+      "change": "modified",
+      "signature_changed": true,
+      "old_signature": "fn process_request(req: &Request) -> Response",
+      "new_signature": "fn process_request(req: &Request, ctx: &Context) -> Response",
+      "body_changed": true
+    },
+    {"name": "old_handler", "file": "src/routes.rs", "kind": "function", "change": "deleted"}
+  ]
+}
+```
+
+#### review-safety
+```json
+{
+  "safe_changes_count": 2,
+  "issues": [
+    {
+      "symbol": "old_handler",
+      "file": "src/routes.rs",
+      "change": "deleted",
+      "unmodified_callers": [
+        {"file": "src/main.rs", "line": 88, "text": "old_handler()", "also_modified_in_pr": false}
+      ],
+      "risk": "high"
+    }
+  ]
+}
+```
+
+#### review-impact
+```json
+{
+  "symbol": "process_request",
+  "file": "src/routes.rs",
+  "change": "modified",
+  "signature_changed": true,
+  "base_callers": [
+    {"file": "src/main.rs", "line": 42, "text": "process_request(&req)", "also_modified_in_pr": false},
+    {"file": "src/handlers.rs", "line": 18, "text": "process_request(&r)", "also_modified_in_pr": true}
+  ],
+  "unmodified_callers_count": 1,
+  "tests": [
+    {"name": "test_process_request", "file": "tests/test.rs", "line": 10, "also_modified_in_pr": false}
+  ],
+  "risk": "high"
+}
+```
+
+#### review-test-coverage
+```json
+{
+  "coverage_ratio": "3/5",
+  "covered": [
+    {"symbol": "new_handler", "file": "src/routes.rs", "kind": "function", "tests": ["test_new_handler"]}
+  ],
+  "uncovered": [
+    {"symbol": "another_fn", "file": "src/routes.rs", "kind": "function", "change": "added"}
+  ]
+}
+```
 
 ## Mark Types
 

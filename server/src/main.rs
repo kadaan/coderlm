@@ -1,6 +1,8 @@
 mod config;
+mod git;
 mod index;
 mod ops;
+mod review;
 mod server;
 mod symbols;
 
@@ -41,31 +43,32 @@ enum Commands {
         /// Maximum number of concurrent indexed projects
         #[arg(long, default_value = "5")]
         max_projects: usize,
+
+        /// Verbose logging: -v debug, -vv trace (overridden by RUST_LOG)
+        #[arg(short, long, action = clap::ArgAction::Count)]
+        verbose: u8,
     },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize tracing
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
-    info!("coderlm v{}", env!("CARGO_PKG_VERSION"));
-
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Serve {
-            path,
-            port,
-            bind,
-            max_file_size,
-            max_projects,
-        } => {
+        Commands::Serve { path, port, bind, max_file_size, max_projects, verbose } => {
+            let default_filter = match verbose {
+                0 => "info",
+                1 => "coderlm_server=debug,tower_http=debug",
+                _ => "coderlm_server=trace,tower_http=debug",
+            };
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter)),
+                )
+                .init();
+
+            info!("coderlm v{}", env!("CARGO_PKG_VERSION"));
             run_server(path, port, bind, max_file_size, max_projects).await?;
         }
     }
@@ -83,12 +86,13 @@ async fn run_server(
     // Create shared state
     let state = AppState::new(max_projects, max_file_size);
 
-    // If an initial path was provided, pre-index it
+    // If an initial path was provided, pre-index it and restore any persisted reviews.
     if let Some(ref p) = path {
         info!("Pre-indexing project: {}", p.display());
         state.get_or_create_project(p).map_err(|e| {
             anyhow::anyhow!("Failed to index '{}': {}", p.display(), e)
         })?;
+        state.restore_reviews(p).await;
     }
 
     // Build router

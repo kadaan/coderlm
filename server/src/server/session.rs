@@ -15,6 +15,9 @@ pub struct HistoryEntry {
 pub struct Session {
     pub id: String,
     pub project_path: PathBuf,
+    /// Review attached to this session, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub last_active: DateTime<Utc>,
     pub history: Vec<HistoryEntry>,
@@ -26,6 +29,7 @@ impl Session {
         Self {
             id,
             project_path,
+            review_id: None,
             created_at: now,
             last_active: now,
             history: Vec::new(),

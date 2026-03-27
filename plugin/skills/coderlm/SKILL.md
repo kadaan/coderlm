@@ -100,7 +100,41 @@ Annotations persist across queries within a session — build shared understandi
 ### Cleanup
 
 ```bash
-cli cleanup                               # End session
+cli cleanup                               # End session (also cleans up any review)
+```
+
+### Code Review
+
+Code review mode indexes two snapshots of the repo — the base branch and the PR branch — and provides semantic diff queries.
+
+```bash
+# Setup: create session first, then attach a review
+cli init
+cli review-init --base main              # Indexes base + computes diff (polls until ready)
+
+# Orientation
+cli review-summary                        # Stats: files/symbols added/deleted/modified
+cli review-files                          # List of changed files
+cli review-symbols                        # All changed symbols
+cli review-symbols --change modified      # Only modified symbols
+cli review-symbols --file src/routes.rs   # Changes in a specific file
+
+# Safety analysis (highest value)
+cli review-safety                         # Deleted/changed symbols with unmodified callers
+
+# Per-symbol drill-down
+cli review-impact process_request --file src/routes.rs   # Who depends on this?
+cli impl process_request --file src/routes.rs             # New version
+cli impl process_request --file src/routes.rs --branch base  # Old version
+
+# File-level diff
+cli review-file-diff --file src/routes.rs
+
+# Test coverage
+cli review-test-coverage                  # Which added/modified symbols have no tests?
+
+# Cleanup
+cli review-cleanup                        # Delete review, clean up worktree
 ```
 
 ## Inputs
@@ -124,6 +158,21 @@ If no query is provided, ask what the user wants to find or understand about the
 8. **Synthesize** — Compile findings into a coherent answer with specific file:line references.
 
 Steps 3–7 repeat. A typical exploration is: find a symbol → read its implementation → trace its callers → read those implementations → discover related symbols → repeat until the causal chain is clear.
+
+## Code Review Workflow
+
+For reviewing a pull request (comparing a base branch against a PR branch):
+
+1. **Init** — `cli init` to index the PR branch (working directory).
+2. **Start review** — `cli review-init --base main` to index the base branch in a worktree, compute the semantic diff, and attach to the session. Waits until ready.
+3. **Orient** — `cli review-summary` to understand the size/scope.
+4. **Changed files** — `cli review-files` to see what changed.
+5. **Changed symbols** — `cli review-symbols` to see what functions/classes were added, removed, or modified.
+6. **Safety check** — `cli review-safety` to find deleted/signature-changed symbols with callers that weren't updated. This is the highest-value step.
+7. **Drill down** — `cli review-impact SYMBOL --file FILE` for per-symbol blast radius. Use `cli impl SYMBOL --file FILE` vs `cli impl SYMBOL --file FILE --branch base` to compare old and new implementations.
+8. **Test coverage** — `cli review-test-coverage` to find new/modified symbols without test coverage.
+9. **Synthesize** — Build a review with specific file:line references, risk assessments, and actionable findings.
+10. **Cleanup** — `cli review-cleanup` (or `cli cleanup` which handles both).
 
 ## When to Use the Server vs Native Tools
 

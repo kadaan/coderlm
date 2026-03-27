@@ -4,7 +4,7 @@ use notify_debouncer_mini::{new_debouncer, DebouncedEventKind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::config;
 use crate::index::file_entry::FileEntry;
@@ -140,7 +140,7 @@ fn handle_file_change(
                 if let Some(mut entry) = file_tree.files.get_mut(rel_path) {
                     entry.symbols_extracted = true;
                 }
-                debug!("Re-extracted {} symbols from {}", count, rel_path);
+                trace!("Re-extracted {} symbols from {}", count, rel_path);
             }
             Err(e) => {
                 debug!("Failed to re-extract symbols from {}: {}", rel_path, e);

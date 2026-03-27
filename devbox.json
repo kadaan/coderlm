@@ -1,0 +1,16 @@
+{
+  "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.14.2/.schema/devbox.schema.json",
+  "packages": [
+    "cargo@latest",
+    "apple-sdk_14@14.4"
+  ],
+  "shell": {
+    "scripts": {
+      "build":         ["cd server && cargo build"],
+      "build:release": ["cd server && cargo build --release"],
+      "check":         ["cd server && cargo check"],
+      "test":          ["cd server && cargo test"],
+      "run":           ["cd server && cargo run -- serve \"$@\""]
+    }
+  }
+}
