@@ -3,6 +3,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use parking_lot::RwLock;
 
+use super::context::FileContextResult;
 use super::{ImpactResult, SafetyReport, TestCoverageReport};
 
 /// Per-review result cache. Reviews are immutable snapshots (base_commit +
@@ -11,6 +12,8 @@ use super::{ImpactResult, SafetyReport, TestCoverageReport};
 pub struct ReviewCache {
     /// Unified diff text per file: file_path -> raw diff string.
     pub file_diffs: DashMap<String, String>,
+    /// File context bundle per file: file_path -> FileContextResult.
+    pub file_contexts: DashMap<String, Arc<FileContextResult>>,
     /// Safety report (expensive: calls find_callers for every risky symbol).
     pub safety_report: RwLock<Option<Arc<SafetyReport>>>,
     /// Test coverage report (expensive: calls find_tests for every changed symbol).
@@ -23,6 +26,7 @@ impl ReviewCache {
     pub fn new() -> Self {
         Self {
             file_diffs: DashMap::new(),
+            file_contexts: DashMap::new(),
             safety_report: RwLock::new(None),
             test_coverage: RwLock::new(None),
             impact_results: DashMap::new(),
@@ -44,9 +48,10 @@ impl ReviewCache {
         *self.safety_report.write() = None;
         *self.test_coverage.write() = None;
 
-        // Remove file-diff cache entries for affected files.
+        // Remove file-diff and file-context cache entries for affected files.
         for f in files {
             self.file_diffs.remove(f);
+            self.file_contexts.remove(f);
         }
 
         // Remove per-symbol impact results for symbols in affected files.

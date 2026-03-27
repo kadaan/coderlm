@@ -9,6 +9,10 @@ pub const SYMBOLS_QUERY: &str = r#"
   body: (block
     (function_definition
       name: (identifier) @method.name) @method.def)?) @class.def
+
+(import_statement) @import.name @import.def
+
+(import_from_statement) @import.name @import.def
 "#;
 
 pub const CALLERS_QUERY: &str = r#"

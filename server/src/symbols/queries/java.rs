@@ -18,6 +18,8 @@ pub const SYMBOLS_QUERY: &str = r#"
 
 (constructor_declaration
   name: (identifier) @constructor.name) @constructor.def
+
+(import_declaration) @import.name @import.def
 "#;
 
 pub const CALLERS_QUERY: &str = r#"

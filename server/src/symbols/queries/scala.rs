@@ -15,6 +15,8 @@ pub const SYMBOLS_QUERY: &str = r#"
 
 (type_definition
   name: (type_identifier) @type.name) @type.def
+
+(import_declaration) @import.name @import.def
 "#;
 
 pub const CALLERS_QUERY: &str = r#"

@@ -116,6 +116,7 @@ pub fn build_routes(state: AppState) -> Router {
         .route("/api/v1/symbols/define", post(define_symbol))
         .route("/api/v1/symbols/redefine", post(redefine_symbol))
         .route("/api/v1/symbols/implementation", get(get_implementation))
+        .route("/api/v1/symbols/implementations", post(batch_implementations))
         .route("/api/v1/symbols/tests", get(find_tests))
         .route("/api/v1/symbols/callers", get(find_callers))
         .route("/api/v1/symbols/variables", get(list_variables))
@@ -138,10 +139,18 @@ pub fn build_routes(state: AppState) -> Router {
         .route("/api/v1/review/files", get(review_files))
         .route("/api/v1/review/symbols", get(review_symbols))
         .route("/api/v1/review/file-diff", get(review_file_diff))
+        // Reviews: file context bundle + symbol diff
+        .route("/api/v1/review/file-context", get(review_file_context))
+        .route("/api/v1/review/symbol-diff", get(review_symbol_diff))
         // Reviews: cross-reference queries
         .route("/api/v1/review/safety", get(review_safety))
         .route("/api/v1/review/impact", get(review_impact))
         .route("/api/v1/review/test-coverage", get(review_test_coverage))
+        .route("/api/v1/review/reference-check", get(review_reference_check))
+        .route("/api/v1/review/body-safety", get(review_body_safety))
+        .route("/api/v1/review/import-diff", get(review_import_diff))
+        .route("/api/v1/review/change-classification", get(review_change_classification))
+        .route("/api/v1/review/complexity", get(review_complexity))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }
@@ -542,6 +551,63 @@ async fn find_callers(
     let preview = format!("{} callers of {}", callers.len(), params.symbol);
     record_history(&state, session_id(&headers).as_deref(), "GET", "/symbols/callers", &preview);
     Ok(Json(json!({ "callers": callers, "count": callers.len() })))
+}
+
+#[derive(Deserialize)]
+struct BatchImplRequest {
+    symbols: Vec<BatchImplItem>,
+    branch: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BatchImplItem {
+    symbol: String,
+    file: String,
+}
+
+async fn batch_implementations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<BatchImplRequest>,
+) -> Result<Json<Value>, AppError> {
+    let project = resolve_project_for_branch(&state, &headers, body.branch.as_deref())?;
+
+    let mut results: Vec<Value> = Vec::new();
+    let mut errors: Vec<Value> = Vec::new();
+
+    for item in &body.symbols {
+        match symbol_ops::get_implementation(
+            &project.root,
+            &project.symbol_table,
+            &item.symbol,
+            &item.file,
+        ) {
+            Ok(source) => {
+                let line_range = project
+                    .symbol_table
+                    .get(&item.file, &item.symbol)
+                    .map(|s| s.line_range);
+                results.push(json!({
+                    "symbol": item.symbol,
+                    "file": item.file,
+                    "source": source,
+                    "line_range": line_range,
+                }));
+            }
+            Err(msg) => {
+                errors.push(json!({ "symbol": item.symbol, "file": item.file, "error": msg }));
+            }
+        }
+    }
+
+    record_history(
+        &state,
+        session_id(&headers).as_deref(),
+        "POST",
+        "/symbols/implementations",
+        &format!("{} symbols", body.symbols.len()),
+    );
+    Ok(Json(json!({ "results": results, "errors": errors })))
 }
 
 #[derive(Deserialize)]
@@ -1048,6 +1114,58 @@ async fn review_file_diff(
     Ok(Json(json!({ "file": file, "diff": diff_text })))
 }
 
+#[derive(Deserialize)]
+struct ReviewFileContextQuery {
+    file: String,
+    context_lines: Option<usize>,
+    max_full_file_lines: Option<usize>,
+}
+
+async fn review_file_context(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<ReviewFileContextQuery>,
+) -> Result<Json<Value>, AppError> {
+    let review = require_ready_review(&state, &headers)?;
+    let context_lines = params.context_lines.unwrap_or(50);
+    let max_full_file_lines = params.max_full_file_lines.unwrap_or(500);
+    let file = params.file.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        review::context::compute_file_context(&review, &file, context_lines, max_full_file_lines)
+    })
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?
+    .map_err(|e| AppError::BadRequest(e.to_string()))?;
+
+    Ok(Json(serde_json::to_value(result.as_ref()).unwrap()))
+}
+
+#[derive(Deserialize)]
+struct ReviewSymbolDiffQuery {
+    symbol: String,
+    file: String,
+}
+
+async fn review_symbol_diff(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<ReviewSymbolDiffQuery>,
+) -> Result<Json<Value>, AppError> {
+    let review = require_ready_review(&state, &headers)?;
+    let symbol = params.symbol.clone();
+    let file = params.file.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        review::context::compute_symbol_diff(&review, &symbol, &file)
+    })
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?
+    .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    Ok(Json(serde_json::to_value(&result).unwrap()))
+}
+
 // ---------------------------------------------------------------------------
 // Reviews: cross-reference queries
 // ---------------------------------------------------------------------------
@@ -1163,4 +1281,133 @@ async fn review_test_coverage(
     *review.cache.test_coverage.write() = Some(report.clone());
 
     Ok(Json(serde_json::to_value(report.as_ref()).unwrap()))
+}
+
+#[derive(Deserialize)]
+struct ReviewReferenceCheckQuery {
+    symbol: String,
+    file: String,
+}
+
+async fn review_reference_check(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<ReviewReferenceCheckQuery>,
+) -> Result<Json<Value>, AppError> {
+    let review = require_ready_review(&state, &headers)?;
+    let symbol = params.symbol.clone();
+    let file = params.file.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        review::references::compute_reference_check(&review, &symbol, &file)
+    })
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?
+    .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    Ok(Json(serde_json::to_value(&result).unwrap()))
+}
+
+#[derive(Deserialize)]
+struct ReviewBodySafetyQuery {
+    depth: Option<usize>,
+}
+
+async fn review_body_safety(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<ReviewBodySafetyQuery>,
+) -> Result<Json<Value>, AppError> {
+    let review = require_ready_review(&state, &headers)?;
+    let depth = params.depth.unwrap_or(1).clamp(1, 3);
+
+    let base_project = review.base_project.clone();
+    let diff = review.diff.read().clone().expect("status=Ready implies diff is Some");
+
+    let report = tokio::task::spawn_blocking(move || {
+        review::impact::compute_body_safety(&base_project, &diff, depth)
+    })
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    Ok(Json(serde_json::to_value(&report).unwrap()))
+}
+
+#[derive(Deserialize)]
+struct ReviewImportDiffQuery {
+    file: Option<String>,
+}
+
+async fn review_import_diff(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<ReviewImportDiffQuery>,
+) -> Result<Json<Value>, AppError> {
+    let review = require_ready_review(&state, &headers)?;
+
+    if let Some(file) = params.file {
+        let result = tokio::task::spawn_blocking(move || {
+            review::imports::compute_import_diff_for_file(&review, &file)
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("File not found in review diff".into()))?;
+
+        Ok(Json(serde_json::to_value(&result).unwrap()))
+    } else {
+        let results = tokio::task::spawn_blocking(move || {
+            review::imports::compute_import_diff_all(&review)
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+        Ok(Json(serde_json::json!({ "files": results, "count": results.len() })))
+    }
+}
+
+async fn review_change_classification(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let review = require_ready_review(&state, &headers)?;
+
+    let classifications = tokio::task::spawn_blocking(move || {
+        review::classification::compute_change_classification(&review)
+    })
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let count = classifications.len();
+    Ok(Json(serde_json::json!({
+        "classifications": classifications,
+        "count": count,
+    })))
+}
+
+#[derive(Deserialize)]
+struct ReviewComplexityQuery {
+    file: Option<String>,
+}
+
+async fn review_complexity(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<ReviewComplexityQuery>,
+) -> Result<Json<Value>, AppError> {
+    let review = require_ready_review(&state, &headers)?;
+    let file = params.file.clone();
+
+    let deltas = tokio::task::spawn_blocking(move || {
+        review::complexity::compute_complexity(&review, file.as_deref())
+    })
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let count = deltas.len();
+    let regression_count = deltas.iter().filter(|d| d.regression).count();
+    Ok(Json(serde_json::json!({
+        "deltas": deltas,
+        "count": count,
+        "regression_count": regression_count,
+    })))
 }

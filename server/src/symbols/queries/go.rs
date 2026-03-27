@@ -28,6 +28,8 @@ pub const SYMBOLS_QUERY: &str = r#"
 (var_declaration
   (var_spec
     name: (identifier) @const.name)) @const.def
+
+(import_spec) @import.name @import.def
 "#;
 
 pub const CALLERS_QUERY: &str = r#"

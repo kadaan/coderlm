@@ -52,5 +52,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 anyhow = "1"
 
+# In-memory unified diff generation
+similar = "2"
+
 # Temp directories (for git worktrees)
 tempfile = "3"

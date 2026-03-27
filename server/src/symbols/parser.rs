@@ -136,6 +136,13 @@ pub fn extract_symbols_from_file(
                 "mod.def" => {
                     def_node = Some(cap.node);
                 }
+                "import.name" => {
+                    name = Some(text.to_string());
+                    kind = Some(SymbolKind::Import);
+                }
+                "import.def" => {
+                    def_node = Some(cap.node);
+                }
                 _ => {}
             }
         }

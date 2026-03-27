@@ -30,6 +30,8 @@ pub const SYMBOLS_QUERY: &str = r#"
 
 (mod_item
   name: (identifier) @mod.name) @mod.def
+
+(use_declaration) @import.name @import.def
 "#;
 
 pub const CALLERS_QUERY: &str = r#"

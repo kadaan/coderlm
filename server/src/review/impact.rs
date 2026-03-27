@@ -172,6 +172,52 @@ pub fn compute_safety(
     SafetyReport { issues, safe_changes_count: safe_count }
 }
 
+/// Find symbols whose body changed (but signature did NOT) and that have
+/// callers in files NOT modified by this PR.
+///
+/// These are silent behavioral changes — the code compiles but callers may
+/// observe different behavior at runtime. Risk level is `Medium`.
+pub fn compute_body_safety(
+    base_project: &Project,
+    review_diff: &ReviewDiff,
+    depth: usize,
+) -> SafetyReport {
+    let modified = modified_files(review_diff);
+    let mut issues: Vec<SafetyIssue> = Vec::new();
+    let mut safe_count = 0usize;
+
+    for sym_diff in &review_diff.symbol_diffs {
+        let is_body_only_change = matches!(
+            &sym_diff.change,
+            SymbolChange::Modified { signature_changed: false, body_changed: true, .. }
+                | SymbolChange::Moved { signature_changed: false, body_changed: true, .. }
+        );
+        if !is_body_only_change {
+            continue;
+        }
+
+        let callers =
+            collect_callers_bfs(base_project, &sym_diff.name, &sym_diff.file, depth, &modified);
+
+        let unmodified: Vec<CallerWithRisk> =
+            callers.into_iter().filter(|c| !c.also_modified_in_pr).collect();
+
+        if unmodified.is_empty() {
+            safe_count += 1;
+        } else {
+            issues.push(SafetyIssue {
+                symbol: sym_diff.name.clone(),
+                file: sym_diff.file.clone(),
+                change: sym_diff.change.clone(),
+                unmodified_callers: unmodified,
+                risk: RiskLevel::Medium,
+            });
+        }
+    }
+
+    SafetyReport { issues, safe_changes_count: safe_count }
+}
+
 /// Compute the blast radius for a specific changed symbol: all callers in the
 /// base branch, annotated with whether each also appears in modified PR files.
 ///

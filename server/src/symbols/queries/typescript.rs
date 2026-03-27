@@ -23,6 +23,8 @@ pub const SYMBOLS_QUERY: &str = r#"
 
 (enum_declaration
   name: (identifier) @enum.name) @enum.def
+
+(import_statement) @import.name @import.def
 "#;
 
 pub const CALLERS_QUERY: &str = r#"
@@ -89,6 +91,8 @@ pub const JS_SYMBOLS_QUERY: &str = r#"
   (variable_declarator
     name: (identifier) @const.name
     value: (arrow_function))) @const.def
+
+(import_statement) @import.name @import.def
 "#;
 
 pub const JS_CALLERS_QUERY: &str = r#"

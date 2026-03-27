@@ -1,7 +1,12 @@
 pub mod cache;
+pub mod classification;
+pub mod complexity;
+pub mod context;
 pub mod diff;
 pub mod impact;
+pub mod imports;
 pub mod persistence;
+pub mod references;
 
 use std::path::PathBuf;
 use std::sync::Arc;
