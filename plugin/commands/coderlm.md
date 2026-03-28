@@ -1,31 +1,35 @@
 ---
 name: coderlm
-description: Explore a codebase using tree-sitter-backed indexing. Use when you need to understand how code works, trace execution paths, find where errors originate, or understand the sequence of events that produce a particular outcome. Prefer this over grep/glob/read for structural code questions.
+description: Explore a codebase and review pull request diffs using tree-sitter-backed indexing. Use when you need to understand how code works, trace execution paths, find where errors originate, or assess the risk and impact of a diff. Prefer this over grep/glob/read for structural code questions and over manual diff reading for PR review.
 ---
 
 # CodeRLM — Structural Codebase Exploration
 
 You have access to a tree-sitter-backed index server that knows the structure of this codebase: every function, every caller, every symbol. Use it instead of guessing with grep.
 
-## Setup
-
-```bash
-# Initialize a session (do this once per project)
-python3 .claude/coderlm_state/coderlm_cli.py init
-```
-
 ## Tools
 
 ```bash
-CLI=".claude/coderlm_state/coderlm_cli.py"
+CLI="${CLAUDE_SKILL_DIR}/scripts/coderlm"
 
-python3 $CLI structure                          # File tree + module overview
-python3 $CLI search "symbol_name"               # Find symbols by name
-python3 $CLI impl function_name --file path     # Get exact implementation
-python3 $CLI callers function_name --file path  # Who calls this function?
-python3 $CLI tests --file path                  # Find tests covering this file
-python3 $CLI grep "pattern"                     # Scope-aware pattern search
-python3 $CLI peek path --start N --end N        # Read a specific line range
+# Codebase exploration
+$CLI structure                          # File tree + module overview
+$CLI search "symbol_name"               # Find symbols by name
+$CLI impl function_name --file path     # Get exact implementation
+$CLI callers function_name --file path  # Who calls this function?
+$CLI tests --file path                  # Find tests covering this file
+$CLI grep "pattern"                     # Scope-aware pattern search
+$CLI peek path --start N --end N        # Read a specific line range
+
+# PR / diff review (attach a review first, then query the diff)
+$CLI review-init --base REF             # Index a diff and attach it to the session
+$CLI review-summary                     # Diff scope: file + symbol counts
+$CLI review-files                       # Every changed file with status and language
+$CLI review-change-classification       # Classify each changed symbol by change type
+$CLI review-safety                      # Signature/deletion changes with unmodified callers
+$CLI review-body-safety                 # Behavioral changes with unmodified callers
+$CLI review-symbol-diff --symbol S --file F   # Before/after body diff for one symbol
+$CLI review-impact --symbol S --file F        # Unmodified callers + risk rating
 ```
 
 ## How to Explore
@@ -49,5 +53,6 @@ With the index, you get:
 - **Caller chains** instead of grep-and-hope — know exactly what invokes a function
 - **Exact implementations** instead of full-file reads — get the function body, not 500 lines of context
 - **Test discovery** — find what's already tested before writing new tests
+- **Diff-aware review** instead of reading raw patches — query changed symbols, classify changes, and surface unmodified callers at risk without reading every modified file
 
 ## $ARGUMENTS
