@@ -1,6 +1,7 @@
 mod config;
 mod git;
 mod index;
+mod mcp;
 mod ops;
 mod review;
 mod server;
@@ -11,6 +12,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use tracing::info;
 
+use rmcp::ServiceExt;
 use server::state::AppState;
 
 #[derive(Parser)]
@@ -48,6 +50,20 @@ enum Commands {
         #[arg(short, long, action = clap::ArgAction::Count)]
         verbose: u8,
     },
+
+    /// Start an MCP server over stdio for a single project directory
+    Mcp {
+        /// Project directory to index
+        path: PathBuf,
+
+        /// Maximum file size in bytes to index
+        #[arg(long, default_value_t = config::DEFAULT_MAX_FILE_SIZE)]
+        max_file_size: u64,
+
+        /// Verbose logging: -v debug, -vv trace (overridden by RUST_LOG)
+        #[arg(short, long, action = clap::ArgAction::Count)]
+        verbose: u8,
+    },
 }
 
 #[tokio::main]
@@ -70,6 +86,30 @@ async fn main() -> anyhow::Result<()> {
 
             info!("coderlm v{}", env!("CARGO_PKG_VERSION"));
             run_server(path, port, bind, max_file_size, max_projects).await?;
+        }
+
+        Commands::Mcp { path, max_file_size, verbose } => {
+            // Log to stderr — stdout is reserved for MCP JSON-RPC.
+            let default_filter = match verbose {
+                0 => "info",
+                1 => "coderlm_server=debug",
+                _ => "coderlm_server=trace",
+            };
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .with_ansi(false)
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter)),
+                )
+                .init();
+
+            info!("coderlm-mcp v{} indexing {}", env!("CARGO_PKG_VERSION"), path.display());
+            let server = mcp::server::McpServer::new(path, max_file_size).await?;
+            let service = server.serve(rmcp::transport::stdio()).await
+                .map_err(|e| anyhow::anyhow!("MCP transport error: {e}"))?;
+            service.waiting().await
+                .map_err(|e| anyhow::anyhow!("MCP service error: {e}"))?;
         }
     }
 
