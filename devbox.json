@@ -10,7 +10,7 @@
       "build:release": ["cd server && cargo build --release"],
       "check":         ["cd server && cargo check"],
       "test":          ["cd server && cargo test"],
-      "run":           ["cd server && cargo run -- serve \"$@\""]
+      "server":        ["cd server && cargo run -- serve \"$@\""]
     }
   }
 }

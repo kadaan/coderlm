@@ -297,6 +297,11 @@ pub fn compute_test_coverage(
     let mut uncovered: Vec<UncoveredSymbol> = Vec::new();
 
     for sym_diff in &review_diff.symbol_diffs {
+        // Imports don't have meaningful test coverage — skip them.
+        if sym_diff.kind == SymbolKind::Import {
+            continue;
+        }
+
         let change_label = match &sym_diff.change {
             SymbolChange::Added => "added",
             SymbolChange::Modified { .. } => "modified",
@@ -315,7 +320,11 @@ pub fn compute_test_coverage(
             Err(_) => vec![],
         };
 
-        if tests.is_empty() {
+        // Deduplicate by test name before counting.
+        let mut seen = std::collections::HashSet::new();
+        let unique_count = tests.into_iter().filter(|t| seen.insert(t.name.clone())).count();
+
+        if unique_count == 0 {
             uncovered.push(UncoveredSymbol {
                 symbol: sym_diff.name.clone(),
                 file: sym_diff.file.clone(),
@@ -327,7 +336,7 @@ pub fn compute_test_coverage(
                 symbol: sym_diff.name.clone(),
                 file: sym_diff.file.clone(),
                 kind: sym_diff.kind,
-                tests: tests.iter().map(|t| t.name.clone()).collect(),
+                test_count: unique_count,
             });
         }
     }

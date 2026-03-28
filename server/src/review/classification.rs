@@ -9,7 +9,7 @@ pub struct SymbolClassification {
     pub symbol: String,
     pub kind: SymbolKind,
     pub classification: String,
-    pub sub_classifications: Vec<String>,
+    pub sub_classification: String,
 }
 
 /// Classify every changed symbol in the review diff by the semantic nature
@@ -24,13 +24,13 @@ pub fn compute_change_classification(review: &Review) -> Vec<SymbolClassificatio
     let mut classifications = Vec::new();
 
     for sym in &diff.symbol_diffs {
-        let (classification, sub_classifications) = classify_symbol(review, sym);
+        let (classification, sub_classification) = classify_symbol(review, sym);
         classifications.push(SymbolClassification {
             file: sym.file.clone(),
             symbol: sym.name.clone(),
             kind: sym.kind,
             classification,
-            sub_classifications,
+            sub_classification,
         });
     }
 
@@ -40,16 +40,16 @@ pub fn compute_change_classification(review: &Review) -> Vec<SymbolClassificatio
 fn classify_symbol(
     review: &Review,
     sym: &crate::review::SymbolDiffEntry,
-) -> (String, Vec<String>) {
+) -> (String, String) {
     // Imports get their own category regardless of change type.
     if sym.kind == SymbolKind::Import {
-        return ("import_change".to_string(), vec![]);
+        return ("import_change".to_string(), String::new());
     }
 
     match &sym.change {
-        SymbolChange::Added => ("structural".to_string(), vec!["added".to_string()]),
-        SymbolChange::Deleted => ("structural".to_string(), vec!["deleted".to_string()]),
-        SymbolChange::Moved { .. } => ("structural".to_string(), vec!["moved".to_string()]),
+        SymbolChange::Added => ("structural".to_string(), "added".to_string()),
+        SymbolChange::Deleted => ("structural".to_string(), "deleted".to_string()),
+        SymbolChange::Moved { .. } => ("structural".to_string(), "moved".to_string()),
 
         SymbolChange::Modified { signature_changed, body_changed, .. } => {
             let is_type_symbol = matches!(
@@ -59,30 +59,21 @@ fn classify_symbol(
 
             if *signature_changed {
                 if is_type_symbol {
-                    ("type_change".to_string(), vec!["signature_changed".to_string()])
+                    ("type_change".to_string(), "signature_changed".to_string())
                 } else {
-                    ("api_surface_change".to_string(), vec!["signature_changed".to_string()])
+                    ("api_surface_change".to_string(), "signature_changed".to_string())
                 }
             } else if *body_changed {
                 if is_type_symbol {
-                    ("type_change".to_string(), vec!["body_change".to_string()])
+                    ("type_change".to_string(), "body_change".to_string())
+                } else if has_error_handling_change(review, &sym.name, &sym.file) {
+                    ("error_handling_change".to_string(), "error_handling_change".to_string())
                 } else {
-                    // Check if the change is primarily error-handling related.
-                    let sub = if has_error_handling_change(review, &sym.name, &sym.file) {
-                        vec!["error_handling_change".to_string()]
-                    } else {
-                        vec!["body_logic_change".to_string()]
-                    };
-                    let classification = if sub[0] == "error_handling_change" {
-                        "error_handling_change".to_string()
-                    } else {
-                        "behavioral".to_string()
-                    };
-                    (classification, sub)
+                    ("behavioral".to_string(), "body_logic_change".to_string())
                 }
             } else {
                 // signature_changed=false, body_changed=false: no visible change (edge case).
-                ("behavioral".to_string(), vec![])
+                ("behavioral".to_string(), String::new())
             }
         }
     }

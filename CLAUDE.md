@@ -95,8 +95,8 @@ python3 plugin/skills/coderlm/scripts/coderlm_cli.py <command> [args]
 
 The `.claude/skills/coderlm/scripts/coderlm_cli.py` path also works when running locally (via the workaround copy).
 
-Session state cached in `.claude/coderlm_state/session.json`. The CLI must be run from the project root that was indexed. Key commands: `init`, `structure`, `symbols`, `search`, `impl`, `callers`, `tests`, `grep` (with `--scope code`), `peek`, `save-annotations`, `load-annotations`, `cleanup`. Full reference in `plugin/skills/coderlm/references/api-reference.md`.
+Session state cached in `.claude/coderlm_state/session.json`. The CLI must be run from the project root that was indexed. Sessions are created automatically on first use — `init` is optional (use it only to target a non-default server or directory). Key commands: `structure`, `symbols`, `search`, `impl`, `callers`, `tests`, `grep` (with `--scope code`), `peek`, `save-annotations`, `load-annotations`, `cleanup`. Full reference in `plugin/skills/coderlm/references/api-reference.md`.
 
 ## Workflow: Codebase Exploration
 
-Always use `/coderlm` (the coderlm skill) when exploring this codebase. It provides indexed lookups for symbols, implementations, callers, and tests — much faster and more precise than globbing/grepping/reading files manually. Start with `init`, then use `search`, `impl`, `callers`, `grep`, etc. See `plugin/skills/coderlm/` for full reference.
+Always use `/coderlm` (the coderlm skill) when exploring this codebase. It provides indexed lookups for symbols, implementations, callers, and tests — much faster and more precise than globbing/grepping/reading files manually. Use `search`, `impl`, `callers`, `grep`, etc. directly — no initialization needed. See `plugin/skills/coderlm/` for full reference.

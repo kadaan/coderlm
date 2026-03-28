@@ -48,9 +48,13 @@ pub struct Review {
     pub head_commit: RwLock<String>,
     pub base_project: Arc<Project>,
     pub head_project: Arc<Project>,
-    /// Owns the worktree; dropped (cleaned up) when the Review is dropped.
+    /// Owns the base worktree; dropped (cleaned up) when the Review is dropped.
     #[allow(dead_code)]
     pub worktree: WorktreeInfo,
+    /// Owns the head worktree when the review was created against an explicit
+    /// head_ref that differs from the cwd HEAD. None when the cwd itself is the head.
+    #[allow(dead_code)]
+    pub head_worktree: Option<WorktreeInfo>,
     pub diff: RwLock<Option<Arc<ReviewDiff>>>,
     pub status: RwLock<ReviewStatus>,
     pub created_at: DateTime<Utc>,
@@ -189,7 +193,7 @@ pub struct CoveredSymbol {
     pub symbol: String,
     pub file: String,
     pub kind: SymbolKind,
-    pub tests: Vec<String>,
+    pub test_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]

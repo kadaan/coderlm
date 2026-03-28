@@ -169,8 +169,21 @@ impl AppState {
             base_ref, head_ref, base_commit, head_commit
         );
 
-        // Index the head project (current working directory)
-        let head_project = self.get_or_create_project(&canonical_cwd)?;
+        // Determine whether the cwd already has head_ref checked out.
+        // If the cwd HEAD matches head_commit, use cwd as the head project.
+        // Otherwise, create a separate worktree for head so that symbol extraction
+        // reflects the correct commit even when the user hasn't checked it out locally.
+        let cwd_head = git::resolve_ref(&canonical_cwd, "HEAD").unwrap_or_default();
+        let (head_project, head_worktree) = if head_commit == cwd_head {
+            (self.get_or_create_project(&canonical_cwd)?, None)
+        } else {
+            let wt = git::create_worktree(&repo_root, head_ref, &head_commit)
+                .map_err(|e| AppError::Internal(format!("Failed to create head worktree: {}", e)))?;
+            let wt_path = wt.path.clone();
+            info!("Head commit {} differs from cwd HEAD {}; using head worktree at {}",
+                &head_commit[..8], &cwd_head[..8], wt_path.display());
+            (self.get_or_create_project(&wt_path)?, Some(wt))
+        };
 
         // Create the base worktree
         let worktree = git::create_worktree(&repo_root, base_ref, &base_commit)
@@ -208,6 +221,7 @@ impl AppState {
             base_project: base_project.clone(),
             head_project: head_project.clone(),
             worktree,
+            head_worktree,
             diff: parking_lot::RwLock::new(None),
             status: parking_lot::RwLock::new(ReviewStatus::Indexing),
             created_at: Utc::now(),
@@ -419,8 +433,18 @@ impl AppState {
 
         let worktree_path = worktree.path.clone();
 
-        // Index both projects — reuse cached base data if available.
-        let head_project = self.get_or_create_project(&pr.repo_root)?;
+        // Recreate head worktree if the head commit differs from the repo's current HEAD.
+        let cwd_head = git::resolve_ref(&pr.repo_root, "HEAD").unwrap_or_default();
+        let (head_project, head_worktree) = if pr.head_commit == cwd_head {
+            (self.get_or_create_project(&pr.repo_root)?, None)
+        } else {
+            let wt = git::create_worktree(&pr.repo_root, &pr.head_ref, &pr.head_commit)
+                .map_err(|e| AppError::Internal(format!("Failed to re-create head worktree: {}", e)))?;
+            let wt_path = wt.path.clone();
+            (self.get_or_create_project(&wt_path)?, Some(wt))
+        };
+
+        // Index the base project — reuse cached data if available.
         let base_project = if let Some(cached) = self.inner.base_cache.get(&pr.base_commit) {
             *cached.last_used.lock() = Utc::now();
             let project = Arc::new(Project {
@@ -447,6 +471,7 @@ impl AppState {
             base_project: base_project.clone(),
             head_project: head_project.clone(),
             worktree,
+            head_worktree,
             diff: parking_lot::RwLock::new(Some(Arc::new(pr.diff))),
             status: parking_lot::RwLock::new(ReviewStatus::Indexing),
             created_at: pr.created_at,

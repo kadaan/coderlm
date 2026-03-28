@@ -4,8 +4,16 @@
 Manages session state and provides clean commands for codebase exploration.
 All state is cached in .claude/coderlm_state/session.json relative to cwd.
 
+Output format: markdown by default. Use --output json or set CODERLM_FORMAT=json
+for raw JSON (e.g. when piping to other tools or for backward compatibility).
+
 Usage:
+  python3 coderlm_cli.py [--output json|markdown] COMMAND [args]
+
+  Sessions are created automatically on first use. init is optional (use it
+  only to target a non-default server or directory):
   python3 coderlm_cli.py init [--port PORT] [--cwd PATH]
+
   python3 coderlm_cli.py structure [--depth N]
   python3 coderlm_cli.py symbols [--kind KIND] [--file FILE] [--limit N] [--branch base]
   python3 coderlm_cli.py search QUERY [--limit N]
@@ -27,7 +35,7 @@ Usage:
   python3 coderlm_cli.py status
   python3 coderlm_cli.py cleanup
 
-Review commands (require an active session):
+Review commands (require an active session with an attached review):
   python3 coderlm_cli.py review-init --base REF [--head REF]
   python3 coderlm_cli.py review-status
   python3 coderlm_cli.py review-cleanup
@@ -35,10 +43,18 @@ Review commands (require an active session):
   python3 coderlm_cli.py review-files
   python3 coderlm_cli.py review-symbols [--change added|deleted|modified] [--file PATH] [--kind KIND]
   python3 coderlm_cli.py review-file-diff --file PATH
-  python3 coderlm_cli.py review-safety
-  python3 coderlm_cli.py review-impact SYMBOL --file PATH
+  python3 coderlm_cli.py review-safety [--depth N]
+  python3 coderlm_cli.py review-impact SYMBOL --file PATH [--depth N]
   python3 coderlm_cli.py review-test-coverage
   python3 coderlm_cli.py review-update [--head REF]
+  python3 coderlm_cli.py review-file-context --file PATH [--context-lines N] [--max-full-file-lines N]
+  python3 coderlm_cli.py review-symbol-diff --symbol NAME --file PATH
+  python3 coderlm_cli.py batch-impl --symbols JSON [--branch base]
+  python3 coderlm_cli.py review-reference-check --symbol NAME --file PATH
+  python3 coderlm_cli.py review-body-safety [--depth N]
+  python3 coderlm_cli.py review-import-diff [--file PATH]
+  python3 coderlm_cli.py review-change-classification
+  python3 coderlm_cli.py review-complexity [--file PATH]
 """
 
 from __future__ import annotations
@@ -46,6 +62,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -61,6 +78,29 @@ def _load_state() -> dict:
         return {}
     with STATE_FILE.open() as f:
         return json.load(f)
+
+
+def _auto_state(host: str | None = None, port: int | None = None) -> dict:
+    """Load state from file. If no session exists, auto-create one against cwd."""
+    state = _load_state()
+    if state.get("session_id"):
+        return state
+
+    _host = host or "127.0.0.1"
+    _port = port or 3000
+    cwd = os.path.abspath(os.getcwd())
+    base = f"http://{_host}:{_port}/api/v1"
+
+    result = _request("POST", f"{base}/sessions", data={"cwd": cwd})
+    state = {
+        "session_id": result["session_id"],
+        "host": _host,
+        "port": _port,
+        "project": cwd,
+        "created_at": result.get("created_at", ""),
+    }
+    _save_state(state)
+    return state
 
 
 def _save_state(state: dict) -> None:
@@ -115,7 +155,15 @@ def _request(
 
         if e.code == 410:
             print(
-                "ERROR: Project was evicted from server. Run: coderlm_cli.py init",
+                "ERROR: Project was evicted from server. Re-run your command to auto-reinitialize.",
+                file=sys.stderr,
+            )
+            _clear_state()
+            sys.exit(1)
+
+        if e.code == 404 and "Session '" in err.get("error", ""):
+            print(
+                "ERROR: Session expired (server was restarted). Re-run your command to auto-reinitialize.",
                 file=sys.stderr,
             )
             _clear_state()
@@ -183,6 +231,240 @@ def _output(result: dict) -> None:
     print(json.dumps(result, indent=2))
 
 
+# ── Template engine ────────────────────────────────────────────────────
+
+
+class _NS:
+    """Proxy for dict enabling dot-notation attribute access in templates."""
+
+    __slots__ = ("_raw",)
+
+    def __init__(self, d: dict) -> None:
+        object.__setattr__(self, "_raw", d)
+
+    def __getattr__(self, name: str) -> object:
+        raw = object.__getattribute__(self, "_raw")
+        return _wrap(raw.get(name))
+
+    def __bool__(self) -> bool:
+        return bool(object.__getattribute__(self, "_raw"))
+
+    def __len__(self) -> int:
+        return len(object.__getattribute__(self, "_raw"))
+
+    def __str__(self) -> str:
+        return str(object.__getattribute__(self, "_raw"))
+
+
+def _wrap(v: object) -> object:
+    if isinstance(v, dict):
+        return _NS(v)
+    if isinstance(v, list):
+        return [_wrap(i) for i in v]
+    return v
+
+
+def _unwrap(v: object) -> object:
+    if isinstance(v, _NS):
+        return object.__getattribute__(v, "_raw")
+    if isinstance(v, list):
+        return [_unwrap(i) for i in v]
+    return v
+
+
+def _toon_quote(v: object) -> str:
+    s = "" if v is None else str(v)
+    if "," in s or "\n" in s or s == "":
+        return '"' + s.replace('"', '\\"') + '"'
+    return s
+
+
+def _toon_encode(data: object, name: str) -> str:
+    if isinstance(data, list) and data and all(isinstance(r, dict) for r in data):
+        keys = list(data[0].keys())
+        header = f"{name}[{len(data)}]{{{','.join(keys)}}}:"
+        rows = ["  " + ",".join(_toon_quote(r.get(k)) for k in keys) for r in data]
+        return header + "\n" + "\n".join(rows)
+    if isinstance(data, list):
+        header = f"{name}[{len(data)}]:"
+        rows = ["  " + _toon_quote(v) for v in data]
+        return (header + "\n" + "\n".join(rows)) if rows else header
+    if isinstance(data, dict):
+        rows = ["  " + k + ": " + _toon_quote(v) for k, v in data.items()]
+        return name + ":\n" + "\n".join(rows)
+    return f"{name}: {_toon_quote(data)}"
+
+
+def _toon_block(name: str, data: object) -> str:
+    inner = "```toon\n" + _toon_encode(_unwrap(data), name) + "\n```"
+    return f'<data id="{name}">\n{inner}\n</data>'
+
+
+_TAG_RE = re.compile(r"(\{\{.*?\}\}|\{%.*?%\})", re.DOTALL)
+_SAFE_BUILTINS: dict = {
+    "len": len, "str": str, "int": int, "bool": bool,
+    "None": None, "True": True, "False": False,
+}
+
+
+def _eval_filter(val: object, f: str) -> object:
+    f = f.strip()
+    if f == "length":
+        return len(val) if hasattr(val, "__len__") else 0
+    if f == "upper":
+        return str(val).upper()
+    if f == "lower":
+        return str(val).lower()
+    if f.startswith("default(") and f.endswith(")"):
+        return val if val is not None else f[8:-1]
+    return val
+
+
+def _eval_expr(expr: str, ctx: dict) -> object:
+    parts = expr.split("|", 1)
+    val = eval(parts[0].strip(), {"__builtins__": _SAFE_BUILTINS}, ctx)  # noqa: S307
+    return _eval_filter(val, parts[1]) if len(parts) == 2 else val
+
+
+def _render(template: str, ctx: dict) -> str:  # noqa: C901
+    tokens = _TAG_RE.split(template)
+    i = 0
+    out: list[str] = []
+
+    while i < len(tokens):
+        tok = tokens[i]
+
+        if tok.startswith("{{") and tok.endswith("}}"):
+            try:
+                val = _eval_expr(tok[2:-2], ctx)
+            except Exception:
+                val = ""
+            out.append("" if val is None else str(val))
+
+        elif tok.startswith("{%") and tok.endswith("%}"):
+            tag = tok[2:-2].strip()
+
+            if tag.startswith("for "):
+                m = re.match(r"for\s+(\w+)\s+in\s+(.+)", tag)
+                if m:
+                    var_name = m.group(1)
+                    try:
+                        items = _eval_expr(m.group(2), ctx)
+                    except Exception:
+                        items = []
+                    depth, body = 1, []
+                    i += 1
+                    while i < len(tokens) and depth > 0:
+                        t = tokens[i]
+                        if t.startswith("{%"):
+                            inner = t[2:-2].strip()
+                            if inner.startswith("for "):
+                                depth += 1
+                            elif inner == "endfor":
+                                depth -= 1
+                                if depth == 0:
+                                    break
+                        if depth > 0:
+                            body.append(t)
+                        i += 1
+                    body_tmpl = "".join(body)
+                    for item in (items or []):
+                        out.append(_render(body_tmpl, {**ctx, var_name: item}))
+
+            elif tag.startswith("if "):
+                conditions: list[tuple] = []
+                cur_cond: str | None = tag[3:].strip()
+                cur_body: list[str] = []
+                depth = 1
+                i += 1
+                while i < len(tokens) and depth > 0:
+                    t = tokens[i]
+                    if t.startswith("{%"):
+                        inner = t[2:-2].strip()
+                        if inner.startswith("if "):
+                            depth += 1
+                            cur_body.append(t)
+                        elif inner == "endif":
+                            depth -= 1
+                            if depth == 0:
+                                conditions.append((cur_cond, "".join(cur_body)))
+                                break
+                            else:
+                                cur_body.append(t)
+                        elif depth == 1 and inner.startswith("elif "):
+                            conditions.append((cur_cond, "".join(cur_body)))
+                            cur_cond = inner[5:].strip()
+                            cur_body = []
+                        elif depth == 1 and inner == "else":
+                            conditions.append((cur_cond, "".join(cur_body)))
+                            cur_cond = None
+                            cur_body = []
+                        else:
+                            cur_body.append(t)
+                    else:
+                        cur_body.append(t)
+                    i += 1
+                rendered = False
+                for cond, body_str in conditions:
+                    if cond is None:
+                        if not rendered:
+                            out.append(_render(body_str, ctx))
+                        break
+                    try:
+                        result = _eval_expr(cond, ctx)
+                    except Exception:
+                        result = False
+                    if result and not rendered:
+                        out.append(_render(body_str, ctx))
+                        rendered = True
+
+            elif tag.startswith("toon "):
+                parts = tag[5:].split(None, 1)
+                if len(parts) == 2:
+                    toon_name, toon_expr = parts
+                    try:
+                        toon_data = _eval_expr(toon_expr, ctx)
+                    except Exception:
+                        toon_data = []
+                    out.append(_toon_block(toon_name, toon_data))
+
+        else:
+            out.append(tok)
+
+        i += 1
+
+    return "".join(out)
+
+
+# ── CLI output helpers ─────────────────────────────────────────────────
+
+_CLI = "python3 ${CLAUDE_SKILL_DIR}/scripts/coderlm_cli.py"
+_TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "templates"
+
+
+def _load_template(name: str) -> str:
+    return (_TEMPLATE_DIR / f"{name}.tpl").read_text()
+
+
+def _is_markdown_mode(args: object) -> bool:
+    if os.environ.get("CODERLM_FORMAT") == "json":
+        return False
+    if getattr(args, "output", None) == "json":
+        return False
+    return True
+
+
+def _output_md(text: str) -> None:
+    print(text)
+
+
+def _render_with_cli(template: str, result: dict, **extra: object) -> str:
+    ctx = {k: _wrap(v) for k, v in result.items()}
+    ctx["_cli"] = _CLI
+    ctx.update({k: _wrap(v) for k, v in extra.items()})
+    return _render(template, ctx)
+
+
 # ── Commands ──────────────────────────────────────────────────────────
 
 
@@ -219,43 +501,49 @@ def cmd_init(args: argparse.Namespace) -> None:
 def cmd_status(args: argparse.Namespace) -> None:
     state = _load_state()
     if not state:
-        # No session — just check server health
         host = args.host or "127.0.0.1"
         port = args.port or 3000
         base = f"http://{host}:{port}/api/v1"
-        result = _request("GET", f"{base}/health")
-        _output(result)
+        health = _request("GET", f"{base}/health")
+        info: dict = {"server": health, "session": None}
+        if _is_markdown_mode(args):
+            _output_md(_render_with_cli(_load_template("status"), info))
+        else:
+            _output(health)
         return
 
     base = _base_url(state)
     health = _request("GET", f"{base}/health")
     info = {"server": health, "session": state}
 
-    # Try to get session details
     sid = state.get("session_id")
     if sid:
         try:
-            session_info = _request(
-                "GET",
-                f"{base}/sessions/{sid}",
-            )
+            session_info = _request("GET", f"{base}/sessions/{sid}")
             info["session_details"] = session_info
         except SystemExit:
-            info["session_details"] = "session may have expired"
+            pass
 
-    _output(info)
+    if _is_markdown_mode(args):
+        _output_md(_render_with_cli(_load_template("status"), info))
+    else:
+        _output(info)
 
 
 def cmd_structure(args: argparse.Namespace) -> None:
-    state = _load_state()
+    state = _auto_state()
     params = {}
     if args.depth is not None:
         params["depth"] = args.depth
-    _output(_get(state, "/structure", params))
+    result = _get(state, "/structure", params)
+    if _is_markdown_mode(args):
+        _output_md(_render_with_cli(_load_template("structure"), result))
+    else:
+        _output(result)
 
 
 def cmd_symbols(args: argparse.Namespace) -> None:
-    state = _load_state()
+    state = _auto_state()
     params = {}
     if args.kind:
         params["kind"] = args.kind
@@ -265,63 +553,92 @@ def cmd_symbols(args: argparse.Namespace) -> None:
         params["limit"] = args.limit
     if getattr(args, "branch", None):
         params["branch"] = args.branch
-    _output(_get(state, "/symbols", params))
+    result = _get(state, "/symbols", params)
+    if _is_markdown_mode(args):
+        _output_md(_render_with_cli(_load_template("symbols"), result))
+    else:
+        _output(result)
 
 
 def cmd_search(args: argparse.Namespace) -> None:
-    state = _load_state()
+    state = _auto_state()
     params = {"q": args.query}
     if args.limit is not None:
         params["limit"] = args.limit
-    _output(_get(state, "/symbols/search", params))
+    result = _get(state, "/symbols/search", params)
+    if _is_markdown_mode(args):
+        _output_md(_render_with_cli(_load_template("search"), result, query=args.query))
+    else:
+        _output(result)
 
 
 def cmd_impl(args: argparse.Namespace) -> None:
-    state = _load_state()
+    state = _auto_state()
     params: dict = {"symbol": args.symbol, "file": args.file}
     if getattr(args, "branch", None):
         params["branch"] = args.branch
-    _output(_get(state, "/symbols/implementation", params))
+    result = _get(state, "/symbols/implementation", params)
+    if _is_markdown_mode(args):
+        _output_md(_render_with_cli(_load_template("impl"), result))
+    else:
+        _output(result)
 
 
 def cmd_callers(args: argparse.Namespace) -> None:
-    state = _load_state()
+    state = _auto_state()
     params: dict = {"symbol": args.symbol, "file": args.file}
     if args.limit is not None:
         params["limit"] = args.limit
     if getattr(args, "branch", None):
         params["branch"] = args.branch
-    _output(_get(state, "/symbols/callers", params))
+    result = _get(state, "/symbols/callers", params)
+    if _is_markdown_mode(args):
+        _output_md(_render_with_cli(_load_template("callers"), result, symbol=args.symbol))
+    else:
+        _output(result)
 
 
 def cmd_tests(args: argparse.Namespace) -> None:
-    state = _load_state()
+    state = _auto_state()
     params: dict = {"symbol": args.symbol, "file": args.file}
     if args.limit is not None:
         params["limit"] = args.limit
     if getattr(args, "branch", None):
         params["branch"] = args.branch
-    _output(_get(state, "/symbols/tests", params))
+    result = _get(state, "/symbols/tests", params)
+    if _is_markdown_mode(args):
+        _output_md(_render_with_cli(_load_template("tests"), result, symbol=args.symbol))
+    else:
+        _output(result)
 
 
 def cmd_variables(args: argparse.Namespace) -> None:
-    state = _load_state()
+    state = _auto_state()
     params = {"function": args.function, "file": args.file}
-    _output(_get(state, "/symbols/variables", params))
+    result = _get(state, "/symbols/variables", params)
+    if _is_markdown_mode(args):
+        _output_md(_render_with_cli(_load_template("variables"), result,
+                                    function=args.function, file=args.file))
+    else:
+        _output(result)
 
 
 def cmd_peek(args: argparse.Namespace) -> None:
-    state = _load_state()
+    state = _auto_state()
     params = {"file": args.file}
     if args.start is not None:
         params["start"] = args.start
     if args.end is not None:
         params["end"] = args.end
-    _output(_get(state, "/peek", params))
+    result = _get(state, "/peek", params)
+    if _is_markdown_mode(args):
+        _output_md(_render_with_cli(_load_template("peek"), result, file=args.file))
+    else:
+        _output(result)
 
 
 def cmd_grep(args: argparse.Namespace) -> None:
-    state = _load_state()
+    state = _auto_state()
     params = {"pattern": args.pattern}
     if args.max_matches is not None:
         params["max_matches"] = args.max_matches
@@ -329,21 +646,29 @@ def cmd_grep(args: argparse.Namespace) -> None:
         params["context_lines"] = args.context_lines
     if args.scope is not None:
         params["scope"] = args.scope
-    _output(_get(state, "/grep", params))
+    result = _get(state, "/grep", params)
+    if _is_markdown_mode(args):
+        _output_md(_render_with_cli(_load_template("grep"), result, pattern=args.pattern))
+    else:
+        _output(result)
 
 
 def cmd_chunks(args: argparse.Namespace) -> None:
-    state = _load_state()
+    state = _auto_state()
     params = {"file": args.file}
     if args.size is not None:
         params["size"] = args.size
     if args.overlap is not None:
         params["overlap"] = args.overlap
-    _output(_get(state, "/chunk_indices", params))
+    result = _get(state, "/chunk_indices", params)
+    if _is_markdown_mode(args):
+        _output_md(_render_with_cli(_load_template("chunks"), result, file=args.file))
+    else:
+        _output(result)
 
 
 def cmd_define_file(args: argparse.Namespace) -> None:
-    state = _load_state()
+    state = _auto_state()
     _output(_post(state, "/structure/define", {
         "file": args.file,
         "definition": args.definition,
@@ -351,7 +676,7 @@ def cmd_define_file(args: argparse.Namespace) -> None:
 
 
 def cmd_redefine_file(args: argparse.Namespace) -> None:
-    state = _load_state()
+    state = _auto_state()
     _output(_post(state, "/structure/redefine", {
         "file": args.file,
         "definition": args.definition,
@@ -359,7 +684,7 @@ def cmd_redefine_file(args: argparse.Namespace) -> None:
 
 
 def cmd_define_symbol(args: argparse.Namespace) -> None:
-    state = _load_state()
+    state = _auto_state()
     _output(_post(state, "/symbols/define", {
         "symbol": args.symbol,
         "file": args.file,
@@ -368,7 +693,7 @@ def cmd_define_symbol(args: argparse.Namespace) -> None:
 
 
 def cmd_redefine_symbol(args: argparse.Namespace) -> None:
-    state = _load_state()
+    state = _auto_state()
     _output(_post(state, "/symbols/redefine", {
         "symbol": args.symbol,
         "file": args.file,
@@ -377,7 +702,7 @@ def cmd_redefine_symbol(args: argparse.Namespace) -> None:
 
 
 def cmd_mark(args: argparse.Namespace) -> None:
-    state = _load_state()
+    state = _auto_state()
     _output(_post(state, "/structure/mark", {
         "file": args.file,
         "mark": args.type,
@@ -385,7 +710,7 @@ def cmd_mark(args: argparse.Namespace) -> None:
 
 
 def cmd_history(args: argparse.Namespace) -> None:
-    state = _load_state()
+    state = _auto_state()
     params = {}
     if args.limit is not None:
         params["limit"] = args.limit
@@ -393,12 +718,12 @@ def cmd_history(args: argparse.Namespace) -> None:
 
 
 def cmd_save_annotations(args: argparse.Namespace) -> None:
-    state = _load_state()
+    state = _auto_state()
     _output(_post(state, "/annotations/save", {}))
 
 
 def cmd_load_annotations(args: argparse.Namespace) -> None:
-    state = _load_state()
+    state = _auto_state()
     _output(_post(state, "/annotations/load", {}))
 
 
@@ -430,28 +755,24 @@ def cmd_review_init(args: argparse.Namespace) -> None:
     """Create a review, index the base branch, and attach it to the current session."""
     import time
 
-    state = _load_state()
-    if not state.get("session_id"):
-        print("ERROR: No active session. Run: coderlm_cli.py init", file=sys.stderr)
-        sys.exit(1)
-
+    state = _auto_state()
     cwd = state.get("project", os.getcwd())
     body: dict = {"cwd": cwd, "base_ref": args.base}
     if args.head:
         body["head_ref"] = args.head
 
-    print(f"Creating review: {args.base}..{args.head or 'HEAD'}")
+    progress = sys.stderr if _is_markdown_mode(args) else sys.stdout
+    print(f"Creating review: {args.base}..{args.head or 'HEAD'}", file=progress)
     result = _post_raw(state, "/reviews", body)
     review_id = result["review_id"]
-    print(f"Review created: {review_id}")
-    print(f"Status: {result.get('status', 'unknown')}")
+    print(f"Review created: {review_id}", file=progress)
 
     # Attach the review to the current session
     _post(state, f"/reviews/{review_id}/attach", {})
     state["review_id"] = review_id
     _save_state(state)
 
-    print(f"Attached to session. Polling for ready...")
+    print("Polling for ready...", file=progress)
 
     # Poll until ready (up to 60 seconds)
     for _ in range(120):
@@ -459,21 +780,24 @@ def cmd_review_init(args: argparse.Namespace) -> None:
         status_result = _get_raw(state, f"/reviews/{review_id}")
         status = status_result.get("status", "unknown")
         if status == "ready":
-            print(f"Review ready.")
-            if status_result.get("stats"):
-                s = status_result["stats"]
-                print(f"  Files: +{s.get('files_added',0)} ~{s.get('files_modified',0)} -{s.get('files_deleted',0)}")
-                print(f"  Symbols: +{s.get('symbols_added',0)} ~{s.get('symbols_modified',0)} -{s.get('symbols_deleted',0)}")
+            print("Review ready.", file=progress)
+            if _is_markdown_mode(args):
+                _output_md(_render_with_cli(_load_template("review-init"), status_result))
+            else:
+                if status_result.get("stats"):
+                    s = status_result["stats"]
+                    print(f"  Files: +{s.get('files_added',0)} ~{s.get('files_modified',0)} -{s.get('files_deleted',0)}")
+                    print(f"  Symbols: +{s.get('symbols_added',0)} ~{s.get('symbols_modified',0)} -{s.get('symbols_deleted',0)}")
             return
         if status == "error":
-            print(f"ERROR: Review failed.", file=sys.stderr)
+            print("ERROR: Review failed.", file=sys.stderr)
             sys.exit(1)
 
-    print("WARNING: Review indexing timed out. Try 'review-status' to check progress.")
+    print("WARNING: Review indexing timed out. Try 'review-status' to check progress.", file=progress)
 
 
 def cmd_review_status(args: argparse.Namespace) -> None:
-    state = _load_state()
+    state = _auto_state()
     review_id = state.get("review_id")
     if not review_id:
         print("No review attached to current session.")
@@ -482,7 +806,7 @@ def cmd_review_status(args: argparse.Namespace) -> None:
 
 
 def cmd_review_cleanup(args: argparse.Namespace) -> None:
-    state = _load_state()
+    state = _auto_state()
     review_id = state.get("review_id")
     if not review_id:
         print("No review attached.")
@@ -494,17 +818,25 @@ def cmd_review_cleanup(args: argparse.Namespace) -> None:
 
 
 def cmd_review_summary(args: argparse.Namespace) -> None:
-    state = _load_state()
-    _output(_get(state, "/review/summary"))
+    state = _auto_state()
+    result = _get(state, "/review/summary")
+    if _is_markdown_mode(args):
+        _output_md(_render_with_cli(_load_template("review-summary"), result))
+    else:
+        _output(result)
 
 
 def cmd_review_files(args: argparse.Namespace) -> None:
-    state = _load_state()
-    _output(_get(state, "/review/files"))
+    state = _auto_state()
+    result = _get(state, "/review/files")
+    if _is_markdown_mode(args):
+        _output_md(_render_with_cli(_load_template("review-files"), result))
+    else:
+        _output(result)
 
 
 def cmd_review_symbols(args: argparse.Namespace) -> None:
-    state = _load_state()
+    state = _auto_state()
     params: dict = {}
     if getattr(args, "change", None):
         params["change"] = args.change
@@ -512,38 +844,55 @@ def cmd_review_symbols(args: argparse.Namespace) -> None:
         params["file"] = args.file
     if getattr(args, "kind", None):
         params["kind"] = args.kind
-    _output(_get(state, "/review/symbols", params))
+    result = _get(state, "/review/symbols", params)
+    if _is_markdown_mode(args):
+        _output_md(_render_with_cli(_load_template("review-symbols"), result))
+    else:
+        _output(result)
 
 
 def cmd_review_file_diff(args: argparse.Namespace) -> None:
-    state = _load_state()
+    state = _auto_state()
     _output(_get(state, "/review/file-diff", {"file": args.file}))
 
 
 def cmd_review_safety(args: argparse.Namespace) -> None:
-    state = _load_state()
+    state = _auto_state()
     params: dict = {}
     if getattr(args, "depth", None) is not None:
         params["depth"] = args.depth
-    _output(_get(state, "/review/safety", params))
+    result = _get(state, "/review/safety", params)
+    if _is_markdown_mode(args):
+        _output_md(_render_with_cli(_load_template("review-safety"), result))
+    else:
+        _output(result)
 
 
 def cmd_review_impact(args: argparse.Namespace) -> None:
-    state = _load_state()
+    state = _auto_state()
     params: dict = {"symbol": args.symbol, "file": args.file}
     if getattr(args, "depth", None) is not None:
         params["depth"] = args.depth
-    _output(_get(state, "/review/impact", params))
+    result = _get(state, "/review/impact", params)
+    if _is_markdown_mode(args):
+        _output_md(_render_with_cli(_load_template("review-impact"), result,
+                                    symbol=args.symbol, file=args.file))
+    else:
+        _output(result)
 
 
 def cmd_review_test_coverage(args: argparse.Namespace) -> None:
-    state = _load_state()
-    _output(_get(state, "/review/test-coverage"))
+    state = _auto_state()
+    result = _get(state, "/review/test-coverage")
+    if _is_markdown_mode(args):
+        _output_md(_render_with_cli(_load_template("review-test-coverage"), result))
+    else:
+        _output(result)
 
 
 def cmd_review_update(args: argparse.Namespace) -> None:
     """Incrementally update the attached review to a new head commit."""
-    state = _load_state()
+    state = _auto_state()
     review_id = state.get("review_id")
     if not review_id:
         print("ERROR: No review attached. Run: coderlm_cli.py review-init --base REF", file=sys.stderr)
@@ -557,6 +906,103 @@ def cmd_review_update(args: argparse.Namespace) -> None:
     _output(result)
 
 
+# ── New review commands ────────────────────────────────────────────────
+
+
+def cmd_review_file_context(args: argparse.Namespace) -> None:
+    state = _auto_state()
+    params: dict = {"file": args.file}
+    if getattr(args, "context_lines", None) is not None:
+        params["context_lines"] = args.context_lines
+    if getattr(args, "max_full_file_lines", None) is not None:
+        params["max_full_file_lines"] = args.max_full_file_lines
+    result = _get(state, "/review/file-context", params)
+    if _is_markdown_mode(args):
+        _output_md(_render_with_cli(_load_template("review-file-context"), result))
+    else:
+        _output(result)
+
+
+def cmd_review_symbol_diff(args: argparse.Namespace) -> None:
+    state = _auto_state()
+    params: dict = {"symbol": args.symbol, "file": args.file}
+    result = _get(state, "/review/symbol-diff", params)
+    if _is_markdown_mode(args):
+        _output_md(_render_with_cli(_load_template("review-symbol-diff"), result,
+                                    symbol=args.symbol, file=args.file))
+    else:
+        _output(result)
+
+
+def cmd_batch_impl(args: argparse.Namespace) -> None:
+    state = _auto_state()
+    symbols = json.loads(args.symbols)
+    body: dict = {"symbols": symbols}
+    if getattr(args, "branch", None):
+        body["branch"] = args.branch
+    result = _post(state, "/symbols/implementations", body)
+    if _is_markdown_mode(args):
+        _output_md(_render_with_cli(_load_template("batch-impl"), result))
+    else:
+        _output(result)
+
+
+def cmd_review_reference_check(args: argparse.Namespace) -> None:
+    state = _auto_state()
+    params: dict = {"symbol": args.symbol, "file": args.file}
+    result = _get(state, "/review/reference-check", params)
+    if _is_markdown_mode(args):
+        _output_md(_render_with_cli(_load_template("review-reference-check"), result,
+                                    symbol=args.symbol, file=args.file))
+    else:
+        _output(result)
+
+
+def cmd_review_body_safety(args: argparse.Namespace) -> None:
+    state = _auto_state()
+    params: dict = {}
+    if getattr(args, "depth", None) is not None:
+        params["depth"] = args.depth
+    result = _get(state, "/review/body-safety", params)
+    if _is_markdown_mode(args):
+        _output_md(_render_with_cli(_load_template("review-body-safety"), result))
+    else:
+        _output(result)
+
+
+def cmd_review_import_diff(args: argparse.Namespace) -> None:
+    state = _auto_state()
+    params: dict = {}
+    if getattr(args, "file", None):
+        params["file"] = args.file
+    result = _get(state, "/review/import-diff", params)
+    if _is_markdown_mode(args):
+        _output_md(_render_with_cli(_load_template("review-import-diff"), result))
+    else:
+        _output(result)
+
+
+def cmd_review_change_classification(args: argparse.Namespace) -> None:
+    state = _auto_state()
+    result = _get(state, "/review/change-classification")
+    if _is_markdown_mode(args):
+        _output_md(_render_with_cli(_load_template("review-change-classification"), result))
+    else:
+        _output(result)
+
+
+def cmd_review_complexity(args: argparse.Namespace) -> None:
+    state = _auto_state()
+    params: dict = {}
+    if getattr(args, "file", None):
+        params["file"] = args.file
+    result = _get(state, "/review/complexity", params)
+    if _is_markdown_mode(args):
+        _output_md(_render_with_cli(_load_template("review-complexity"), result))
+    else:
+        _output(result)
+
+
 # ── Parser ────────────────────────────────────────────────────────────
 
 
@@ -564,6 +1010,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="coderlm_cli",
         description="CLI wrapper for coderlm-server API",
+    )
+    p.add_argument(
+        "--output", choices=["json", "markdown"], default=None,
+        help="Output format (default: markdown). Use --output json or CODERLM_FORMAT=json for raw JSON.",
     )
 
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -760,6 +1210,61 @@ def build_parser() -> argparse.ArgumentParser:
     p_ru = sub.add_parser("review-update", help="Incrementally update the review to a new head commit")
     p_ru.add_argument("--head", default=None, help="New head ref (default: HEAD)")
     p_ru.set_defaults(func=cmd_review_update)
+
+    # ── New review commands ──────────────────────────────────────────
+
+    # review-file-context
+    p_rfc = sub.add_parser("review-file-context", help="Full review context for a changed file")
+    p_rfc.add_argument("--file", required=True, help="File path")
+    p_rfc.add_argument("--context-lines", type=int, default=None,
+                       help="Lines of context around changed regions")
+    p_rfc.add_argument("--max-full-file-lines", type=int, default=None,
+                       help="Max lines before switching to changed-regions strategy")
+    p_rfc.set_defaults(func=cmd_review_file_context)
+
+    # review-symbol-diff
+    p_rsd = sub.add_parser("review-symbol-diff", help="Side-by-side diff for a changed symbol")
+    p_rsd.add_argument("--symbol", required=True, help="Symbol name")
+    p_rsd.add_argument("--file", required=True, help="File containing the symbol")
+    p_rsd.set_defaults(func=cmd_review_symbol_diff)
+
+    # batch-impl
+    p_bi = sub.add_parser("batch-impl", help="Fetch implementations for multiple symbols in one call")
+    p_bi.add_argument("--symbols", required=True,
+                      help='JSON array: \'[{"symbol":"foo","file":"src/foo.rs"},...]\' ')
+    p_bi.add_argument("--branch", choices=["base"], default=None,
+                      help="Read from base branch (requires attached review)")
+    p_bi.set_defaults(func=cmd_batch_impl)
+
+    # review-reference-check
+    p_rrc = sub.add_parser("review-reference-check",
+                            help="Find callers of a changed symbol not updated in this PR")
+    p_rrc.add_argument("--symbol", required=True, help="Symbol name")
+    p_rrc.add_argument("--file", required=True, help="File containing the symbol")
+    p_rrc.set_defaults(func=cmd_review_reference_check)
+
+    # review-body-safety
+    p_rbs = sub.add_parser("review-body-safety",
+                            help="Find body-changed symbols (same signature) with unmodified callers")
+    p_rbs.add_argument("--depth", type=int, default=None,
+                       help="Transitive caller depth (default: 1)")
+    p_rbs.set_defaults(func=cmd_review_body_safety)
+
+    # review-import-diff
+    p_rid = sub.add_parser("review-import-diff", help="Show import changes across the PR")
+    p_rid.add_argument("--file", default=None, help="Filter to a specific file")
+    p_rid.set_defaults(func=cmd_review_import_diff)
+
+    # review-change-classification
+    p_rcc = sub.add_parser("review-change-classification",
+                            help="Classify each changed symbol by type of change")
+    p_rcc.set_defaults(func=cmd_review_change_classification)
+
+    # review-complexity
+    p_rc2 = sub.add_parser("review-complexity",
+                            help="Complexity delta (lines, nesting, params) for changed symbols")
+    p_rc2.add_argument("--file", default=None, help="Filter to a specific file")
+    p_rc2.set_defaults(func=cmd_review_complexity)
 
     return p
 
