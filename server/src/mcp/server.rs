@@ -129,7 +129,7 @@ impl McpServer {
     }
 
     fn json_result<T: serde::Serialize>(&self, value: &T) -> Result<CallToolResult, ErrorData> {
-        Ok(match serde_json::to_string_pretty(value) {
+        Ok(match serde_json::to_string(value) {
             Ok(s) => CallToolResult::success(vec![Content::text(s)]),
             Err(e) => CallToolResult::error(vec![Content::text(format!("Serialization error: {e}"))]),
         })
